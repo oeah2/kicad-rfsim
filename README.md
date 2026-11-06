@@ -77,6 +77,8 @@ The geometry goes from the native board objects of KiCad to the model of the sol
 
 **EMerge solves the frequency points in groups of 15**, thus a sweep of 100 solved frequencies holds the matrices of 15 in memory at a time, and not 100. The setting `fem_group` of `model.json` gives another count.
 
+**When the cuDSS factors do not fit in the VRAM of the NVIDIA card, cuDSS keeps them in system RAM, up to `CUDSS_HOST_LIMIT_GB` (10 GiB by default, in `plugins/emerge_runner.py`).** A run that needs more stops with `[rfsim] ERROR: cuDSS needs ... GiB of system RAM`; reduce the mesh or raise that constant. The gate uses the first solved matrix of a sweep; later frequencies reuse its factor storage and are not re-checked.
+
 ### Ports
 
 **A port is at a pad that you select, and it drives that pad against the adjacent copper layer.**
