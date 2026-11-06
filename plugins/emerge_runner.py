@@ -84,6 +84,10 @@ FEM_POINTS = {"coarse": 11, "medium": 21, "fine": 31, "ultrafine": 41}
 # factorization fit, and EMerge frees the matrices of a group after its
 # solves. `settings["fem_group"]` of model.json gives another count.
 SWEEP_GROUP = 15
+# The system RAM that cuDSS may use for its L/U factors, in GiB. cuDSS's
+# hybrid host/device memory mode keeps the factors in RAM; this budget makes
+# 8 GiB of VRAM and 10 GiB of RAM, 18 GiB in total, available.
+CUDSS_HOST_LIMIT_GB = 10
 # The field views sample the plane at about this count of points. The
 # samples come from the FEM solution, thus the count sets only the picture.
 FIELD_POINTS = 60000
@@ -447,6 +451,127 @@ def _mode_search(mw, neff):
             kw["target_neff"] = n
         return orig(port, *args, **kw)
     mw.modal_analysis = modal
+
+
+def _cudss_host_budget(iface, cudss):
+    """Check the host RAM budget after the cuDSS analysis phase.
+
+    **cuDSS reports the peak host memory of the factors only after the
+    analysis phase.** The runner allows `CUDSS_HOST_LIMIT_GB` of system RAM,
+    thus a factorization that needs more stops with a clear message instead
+    of pushing the machine into swap. The device limit was set before the
+    analysis, thus these estimates include it.
+    """
+    limit = getattr(iface, "_rfsim_device_limit", 0)
+    total = getattr(iface, "_rfsim_device_total", 0)
+    min_dev = 0
+    try:
+        param = cudss.DataParam.HYBRID_DEVICE_MEMORY_MIN
+        dtype = cudss.get_data_param_dtype(int(param))
+        need = np.zeros(1, dtype=dtype)
+        wrote = np.zeros(1, dtype=np.uint64)
+        cudss.data_get(iface._handle, iface._data, int(param),
+                       need.ctypes.data, need.nbytes, wrote.ctypes.data)
+        min_dev = int(need[0])
+    except Exception as e:
+        say("cuDSS minimum device memory is not available (%s)" % e)
+
+    if min_dev > limit:
+        raise SystemExit(
+            "[rfsim] ERROR: cuDSS hybrid mode needs at least %.1f GiB of "
+            "device memory, but the budget is %.1f GiB. Free the GPU or "
+            "reduce the mesh." % (min_dev / 1024**3, limit / 1024**3))
+
+    peak_host = None
+    try:
+        param = cudss.DataParam.MEMORY_ESTIMATES
+        dtype = cudss.get_data_param_dtype(int(param))
+        est = np.zeros(16, dtype=dtype)
+        wrote = np.zeros(1, dtype=np.uint64)
+        cudss.data_get(iface._handle, iface._data, int(param),
+                       est.ctypes.data, est.nbytes, wrote.ctypes.data)
+        # 0 permanent device, 1 peak device, 2 permanent host,
+        # 3 peak host, 4 minimum device for the hybrid mode.
+        peak_host = int(est[3])
+    except Exception as e:
+        say("cuDSS memory estimate is not available (%s); the host "
+            "budget is not checked" % e)
+
+    if peak_host is None:
+        say("cuDSS hybrid memory: %.1f of %.1f GiB VRAM for cuDSS, up to "
+            "%.0f GiB host"
+            % (limit / 1024**3, total / 1024**3, CUDSS_HOST_LIMIT_GB))
+        return
+    say("cuDSS hybrid memory: %.1f of %.1f GiB VRAM for cuDSS, up to "
+        "%.0f GiB host; the factors need %.1f GiB host"
+        % (limit / 1024**3, total / 1024**3, CUDSS_HOST_LIMIT_GB,
+           peak_host / 1024**3))
+    if peak_host > CUDSS_HOST_LIMIT_GB * 1024**3:
+        raise SystemExit(
+            "[rfsim] ERROR: cuDSS needs %.1f GiB of system RAM for its "
+            "factors, above the %.0f GiB budget. Reduce the mesh or raise "
+            "CUDSS_HOST_LIMIT_GB in emerge_runner.py."
+            % (peak_host / 1024**3, CUDSS_HOST_LIMIT_GB))
+
+
+def _cudss_hybrid():
+    """Use the cuDSS hybrid host/device memory mode for the factors.
+
+    **EMerge 3.0.0 never sets CUDSS_CONFIG_HYBRID_MODE**, thus a
+    factorization that does not fit in the VRAM of the card fails with
+    CUDSS_STATUS_ALLOC_FAILED. The flag must be set before the analysis
+    phase; patch the constructor of the cuDSS interface, which creates the
+    config. The `_numeric` wrapper checks the host budget and sets the
+    device limit after the analysis and before the factorization.
+
+    Give None, or the cause when this EMerge cannot use the hybrid mode.
+    """
+    try:
+        from emerge._emerge.solvers import cudss
+    except ImportError as e:
+        return "EMerge has no module %s" % e.name
+    if not hasattr(cudss, "CuDSSInterface"):
+        return "its cuDSS interface has another name"
+    if not hasattr(cudss.cudss.ConfigParam, "HYBRID_MODE"):
+        return "its nvmath has no cuDSS hybrid mode"
+    orig_init = cudss.CuDSSInterface.__init__
+    if getattr(orig_init, "_rfsim_hybrid", False):
+        return None
+    orig_numeric = cudss.CuDSSInterface._numeric
+
+    def init(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        param = cudss.cudss.ConfigParam.HYBRID_MODE
+        dtype = cudss.cudss.get_config_param_dtype(int(param))
+        value = np.array(1, dtype=dtype)
+        cudss.cudss.config_set(self._config, int(param),
+                               value.ctypes.data, value.nbytes)
+        # Leave 512 MiB of the card for the matrix A, b and x, which EMerge
+        # holds outside cuDSS, and for the transient copy of A. Set the limit
+        # before the analysis, so the memory estimates of the analysis
+        # include it.
+        import cupy as cp
+        free, total = cp.cuda.runtime.memGetInfo()
+        limit = max(1, int(free) - 512 * 1024**2)
+        param = cudss.cudss.ConfigParam.HYBRID_DEVICE_MEMORY_LIMIT
+        dtype = cudss.cudss.get_config_param_dtype(int(param))
+        value = np.array(limit, dtype=dtype)
+        cudss.cudss.config_set(self._config, int(param),
+                               value.ctypes.data, value.nbytes)
+        self._rfsim_device_limit = limit
+        self._rfsim_device_total = int(total)
+        self._rfsim_host_checked = False
+
+    def _numeric(self, refactorize=False):
+        if not getattr(self, "_rfsim_host_checked", False):
+            _cudss_host_budget(self, cudss.cudss)
+            self._rfsim_host_checked = True
+        return orig_numeric(self, refactorize)
+
+    init._rfsim_hybrid = True
+    cudss.CuDSSInterface.__init__ = init
+    cudss.CuDSSInterface._numeric = _numeric
+    return None
 
 
 def _write_lines(g, ports, wave, outdir):
@@ -870,6 +995,14 @@ def main(model_path, outdir):
 
     mesh = s.get("mesh", "medium")
     notes = ["The solver is EMerge (FEM), version %s" % em.__version__]
+    cause = _cudss_hybrid()
+    if cause is None:
+        notes.append("cuDSS uses hybrid host/device memory: up to %d GiB "
+                     "of system RAM for the factors, on top of the VRAM "
+                     "(18 GiB in total on this 8 GiB card)"
+                     % CUDSS_HOST_LIMIT_GB)
+    else:
+        notes.append("cuDSS hybrid memory mode is unavailable: %s" % cause)
 
     # ---------------------------------------------------------- geometry
     z_of = {c["name"]: c["z"] for c in model["copper_layers"]}
