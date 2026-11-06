@@ -75,6 +75,8 @@ The geometry goes from the native board objects of KiCad to the model of the sol
 5. Set the sweep range, "Define at" (the frequency of the field views and the far field), the ports, the substrate, the mesh preset, the domain margin (or only the area around the ports, for a large board), the run limits and the output directory.
 6. Click Run Simulation. The results open in a plot window, and `results.sNp`, `model.json`, `lines.json` and `farfield_pN.json` go into the output directory.
 
+**EMerge solves the frequency points in groups of 15**, thus a sweep of 100 solved frequencies holds the matrices of 15 in memory at a time, and not 100. The setting `fem_group` of `model.json` gives another count.
+
 ### Ports
 
 **A port is at a pad that you select, and it drives that pad against the adjacent copper layer.**

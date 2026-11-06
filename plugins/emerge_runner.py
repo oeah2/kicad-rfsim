@@ -75,6 +75,15 @@ FEATURE_PART = {"coarse": 0.5, "medium": 0.34, "fine": 0.25,
                 "ultrafine": 0.2}
 # The default count of solved frequencies for each preset.
 FEM_POINTS = {"coarse": 11, "medium": 21, "fine": 31, "ultrafine": 41}
+# **EMerge assembles the complete FEM matrix of EVERY frequency of a group
+# before it solves the first of them, thus a group of N holds N matrices in
+# memory at once.** The count is `frequency_groups` of `run_sweep`, and
+# its default is all the frequencies. The matrix of a board mesh of 36 k
+# tetrahedra used 0.2 GB, thus 100 of them take 20 GB, and the run stops
+# before its first solve ("Precomputing group 0"). 15 matrices and one
+# factorization fit, and EMerge frees the matrices of a group after its
+# solves. `settings["fem_group"]` of model.json gives another count.
+SWEEP_GROUP = 15
 # The field views sample the plane at about this count of points. The
 # samples come from the FEM solution, thus the count sets only the picture.
 FIELD_POINTS = 60000
@@ -1187,7 +1196,14 @@ def main(model_path, outdir):
                      "The S-parameters of a wave port come from E . e* of "
                      "EMerge, because %s. They show a loss of some "
                      "percent that is not in the board" % cause)
-    data = sim.mw.run_sweep()
+    # The frequencies are solved in groups (`SWEEP_GROUP`), thus only one
+    # group of assembled matrices is in memory at a time.
+    group = max(1, min(int(s.get("fem_group") or SWEEP_GROUP), len(fs)))
+    notes.append("It solves %d frequencies in groups of %d, thus at most %d "
+                 "assembled matrices are in memory at a time"
+                 % (len(fs), group, group))
+    say("sweep: %d frequencies in groups of %d" % (len(fs), group))
+    data = sim.mw.run_sweep(frequency_groups=group)
     g = data.scalar.grid
     say("solve: %d frequencies (%.0f s)" % (len(g.freq), time.time() - t0))
     if wave:
