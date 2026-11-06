@@ -856,6 +856,7 @@ def main(model_path, outdir):
     from loguru import logger
 
     sim = em.Simulation("emerge")
+    sim.set_solver(em.solvers.CuDSS)
     # **A line on a board is quasi-TEM, and EMerge must accept that.** The
     # microstrip of the rigs has Hz/Hxy = 0.071 at 3.5 GHz, because the
     # strip has air above it and dielectric below it. EMerge then calls the
