@@ -17,6 +17,7 @@ The geometry goes from the native board objects of KiCad to the model of the sol
 - Simulate more than one set of part values (for example the states of a phase shifter), one run each, and compare the magnitude and the phase of S21 of the states.
 - Feed each port as a lumped, microstrip (MSL), coplanar (CPW) or stripline port, or feed a through-hole pad from a coaxial connector.
 - Extract the geometry from the board: the pads, tracks, arcs, vias, zones, shapes and text on copper.
+- Draw a simulation boundary on a user layer to simulate only the area of interest on a large board.
 - Draw the board layout that the solver uses.
 - Set the substrate, the mesh preset and the CPU threads in the dialog.
 
@@ -72,7 +73,7 @@ The geometry goes from the native board objects of KiCad to the model of the sol
 2. Click the **RFsim** icon in the toolbar, or open Tools > External Plugins and click RFsim.
 3. Look at the preview at the top of the dialog: the ports, the R/L/C parts and the domain.
 4. Select the solver.
-5. Set the sweep range, "Define at" (the frequency of the field views and the far field), the ports, the substrate, the mesh preset, the domain margin (or only the area around the ports, for a large board), the run limits and the output directory.
+5. Set the sweep range, "Define at" (the frequency of the field views and the far field), the ports, the substrate, the mesh preset, the domain margin and the domain (the full board, only the area around the ports, or a drawn boundary), the run limits and the output directory.
 6. Click Run Simulation. The results open in a plot window, and `results.sNp`, `model.json`, `lines.json` and `farfield_pN.json` go into the output directory.
 
 **EMerge solves the frequency points in groups of 15**, thus a sweep of 100 solved frequencies holds the matrices of 15 in memory at a time, and not 100. The setting `fem_group` of `model.json` gives another count.
@@ -138,6 +139,28 @@ Put the center of the sweep at the frequency that matters, or keep the sweep nar
 
 The domain is the board, the margin of air around it, and an absorber 8 cells deep.
 Copper that crosses the outer edge ends in the absorber and does not reflect.
+
+**"Only the area around the ports"** makes the domain the box of the port pads instead of the board.
+Use it when the ports span the structure, for example a filter with a port at each end.
+Use a drawn boundary when the region of interest is not bounded by the ports.
+
+#### A drawn boundary
+
+Draw one closed rectangle with the rectangle tool on a user layer, for example `User.4`, or a layer that you name `RFsim.Boundary`.
+Select it in "Domain".
+The rectangle is the core of the domain: RFsim adds the margin and the absorber outside it.
+The substrate, the copper and any track that crosses the rectangle continue through the margin into the absorber, so the cut looks like a matched load.
+The preview shows the rectangle, the final domain and the inner face of the absorber.
+
+The saving comes from the difference between the board and the rectangle; the margin and the 8 cells of absorber are always added around it.
+
+- **One closed rectangle per layer.** Use a dedicated user layer if the layer has other drawings.
+  A rectangle drawn as four separate lines, a zone, or a footprint graphic is not detected.
+- **Every port must be inside the rectangle.** RFsim refuses a run with a port outside it.
+- **The final domain should stay inside the board.** If the rectangle plus the margin and the absorber crosses the board edge, the board edge is still part of the model, and the cut is not a cut through the board.
+  The model keeps the board outline, and the log names the sides where this happens.
+- **Only an axis-aligned box is supported by the two solvers.** A polygon, a circle or a rotated rectangle uses its bounding box, and the Domain list marks it "(bbox)".
+- **The boundary is a numerical truncation, not a metal wall.** Do not cut through a resonator, a discontinuity or the return path of an antenna.
 
 ### Accuracy
 

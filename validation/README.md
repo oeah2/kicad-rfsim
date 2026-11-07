@@ -47,6 +47,8 @@ The two run the same board and checks.
 
 * **`run_headless_*.py [mesh] [msl|lumped]`**  
 The full path from a board to a Touchstone file. A 50 Ω microstrip must give S11 < −10 dB and S21 > −0.5 dB from 1 to 6 GHz.
+* **`run_boundary_*.py [mesh]`**  
+A 50 Ω line on a large board, with one closed rectangle on a user layer. A full-board run and a run with the drawn boundary must agree in S21 and Z0, and the cropped domain must be smaller.
 * **`run_cpw_*.py [mesh] [cpw|stripline]`**  
 Z0 and eps_eff of the CPW port and the stripline port, against theory. A stripline must give eps_eff = εr.
 * **`run_atten_*.py [mesh]`**  

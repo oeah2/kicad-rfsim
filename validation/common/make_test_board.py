@@ -115,7 +115,12 @@ def _zone(board, layer, net, corners):
     return z
 
 
-def make(path):
+def make(path, size=None):
+    """Make the 50 ohm line. `size` is (x0, y0, x1, y1) of the board.
+
+    The line and its ports stay at X0..X1 and TRACE_Y. A larger size adds
+    empty board and ground around them, for the boundary rig (F40).
+    """
     board = pcbnew.NewBoard(path)
     rf = pcbnew.NETINFO_ITEM(board, "RF")
     gnd = pcbnew.NETINFO_ITEM(board, "GND")
@@ -133,7 +138,7 @@ def make(path):
     t.SetNetCode(rf.GetNetCode())
     board.Add(t)
 
-    x0, y0, x1, y1 = BOARD
+    x0, y0, x1, y1 = size or BOARD
     corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
     _edge_cuts(board, corners)
     _zone(board, pcbnew.B_Cu, gnd, corners)

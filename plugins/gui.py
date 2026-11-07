@@ -301,7 +301,8 @@ def _use_wxagg():
 
 
 def _draw_board(ax, model, compact=False, margin_mm=None, show_lumped=True,
-                pml_mm=None, subregion=False):
+                pml_mm=None, subregion=False, boundary_rect=None,
+                boundary_label=None):
     """Show the top view of the model.
 
     B.Cu is blue, F.Cu is red, the ports are green and the R/L/C parts are
@@ -321,6 +322,11 @@ def _draw_board(ax, model, compact=False, margin_mm=None, show_lumped=True,
                   gives False when no part has its "Model" checkbox.
     subregion     With `margin_mm`: the domain around the port pads, and
                   not around the board (F20), as `extract` makes it.
+    boundary_rect With `margin_mm`: the drawn boundary (F40), and not the
+                  board or the port box, is the core of the domain. It is
+                  shown as a solid line. The results view reads the
+                  boundary from model["boundary"].
+    boundary_label The name of the layer, for the annotation.
     """
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
@@ -339,12 +345,21 @@ def _draw_board(ax, model, compact=False, margin_mm=None, show_lumped=True,
         ax.plot(v["x"], v["y"], "o", color="k", ms=3)
 
     br = m["board_rect"]
+    # **The board outline and board_rect are not the same on a cropped
+    # model.** board_rect is the dielectric extent (region ∩ board), so it
+    # becomes the region when the region is inside the board. Keep the full
+    # outline visible in the preview and the board view.
+    outline = m.get("board_outline") or br
+    bnd = (m.get("boundary") or {}).get("rect")
     if margin_mm is None:
         rg = m["region"]
-    else:  # extract() adds the clear air AND the band to the board bbox
+    else:  # extract() adds the clear air AND the band to the core box
         d = float(margin_mm) + float(margin_mm if pml_mm is None else pml_mm)
         box = br
-        if subregion and m["ports"]:
+        if boundary_rect is not None:
+            box = boundary_rect
+            bnd = boundary_rect
+        elif subregion and m["ports"]:
             ps = m["ports"]
             box = {"x0": min(p["x"] - p["length"] / 2.0 for p in ps),
                    "x1": max(p["x"] + p["length"] / 2.0 for p in ps),
@@ -352,9 +367,20 @@ def _draw_board(ax, model, compact=False, margin_mm=None, show_lumped=True,
                    "y1": max(p["y"] + p["width"] / 2.0 for p in ps)}
         rg = {"x0": box["x0"] - d, "x1": box["x1"] + d,
               "y0": box["y0"] - d, "y1": box["y1"] + d}
-    ax.plot([br["x0"], br["x1"], br["x1"], br["x0"], br["x0"]],
-            [br["y0"], br["y0"], br["y1"], br["y1"], br["y0"]],
+    ax.plot([outline["x0"], outline["x1"], outline["x1"], outline["x0"],
+             outline["x0"]],
+            [outline["y0"], outline["y0"], outline["y1"], outline["y1"],
+             outline["y0"]],
             color="0.25", lw=1.2)
+    if bnd:
+        ax.plot([bnd["x0"], bnd["x1"], bnd["x1"], bnd["x0"], bnd["x0"]],
+                [bnd["y0"], bnd["y0"], bnd["y1"], bnd["y1"], bnd["y0"]],
+                color="tab:orange", lw=1.5, zorder=3)
+        if compact and boundary_label:
+            ax.annotate(boundary_label, (bnd["x0"], bnd["y1"]),
+                        ha="left", va="bottom", xytext=(2, 2),
+                        textcoords="offset points", fontsize=6,
+                        color="darkorange", zorder=6)
     ax.plot([rg["x0"], rg["x1"], rg["x1"], rg["x0"], rg["x0"]],
             [rg["y0"], rg["y0"], rg["y1"], rg["y1"], rg["y0"]],
             "--", color="0.6", lw=0.8)
@@ -402,20 +428,26 @@ def _draw_board(ax, model, compact=False, margin_mm=None, show_lumped=True,
         handles.append(Line2D([], [], color="green", lw=2, marker="o", ms=4,
                               label="R/L/C"))
     handles.append(Line2D([], [], color="0.25", lw=1.2, label="Board edge"))
+    if bnd:
+        handles.append(Line2D([], [], color="tab:orange", lw=1.5,
+                              label="Simulation boundary"))
     handles.append(Line2D([], [], ls="--", color="0.6", label="Domain"))
     if pml:
         handles.append(Line2D([], [], ls=":", color="0.4", label="Absorber"))
 
     ax.set_aspect("equal")
+    # **The frame is the domain, in both views.** On a cropped board the
+    # full outline can be much larger than the region. Auto-scaling to the
+    # outline made the part that is simulated a small island. The outline
+    # is still drawn, and the part outside the frame is clipped.
+    pad = 0.03 * max(rg["x1"] - rg["x0"], rg["y1"] - rg["y0"])
+    ax.set_xlim(rg["x0"] - pad, rg["x1"] + pad)
+    ax.set_ylim(rg["y0"] - pad, rg["y1"] + pad)
     if compact:
         # No legend. The colours are clear near the ports, which have
         # labels, and the legend used one third of the width of the board.
-        # Put the frame on the domain, and do not let matplotlib scale it.
-        # Then the thumbnail always has the same frame, and an annotation
-        # that goes far out does not change it.
-        pad = 0.03 * max(rg["x1"] - rg["x0"], rg["y1"] - rg["y0"])
-        ax.set_xlim(rg["x0"] - pad, rg["x1"] + pad)
-        ax.set_ylim(rg["y0"] - pad, rg["y1"] + pad)
+        # The fixed frame also keeps an annotation that goes far out from
+        # changing the thumbnail.
         ax.set_xticks([])
         ax.set_yticks([])
         for sp in ax.spines.values():
@@ -1008,13 +1040,27 @@ class SettingsDialog(wx.Dialog):
         self.margin = row(rg, "Domain margin:", wx.SpinCtrlDouble(
             self, min=2.0, max=50.0, initial=4.0, inc=0.5), "mm")
         # F20: the domain around the port pads, and not the full board.
-        self.subregion = row(rg, "Domain:", wx.CheckBox(
-            self, label="Only the area around the ports"))
-        self.subregion.SetToolTip(
-            "The domain is the box of the port pads plus the margin. The "
-            "copper, the vias and the parts outside it are not in the "
-            "model. This is faster on a large board. The copper that the "
-            "edge cuts ends in the absorber.")
+        # F40: a closed rectangle on a user layer, and not the full board.
+        # A wx.Choice replaces the old checkbox, thus the dialog does not
+        # grow by a row. The candidates come from the preview model.
+        self._boundary_candidates = list(
+            (preview or {}).get("boundary_candidates") or [])
+        dom = ["Full board", "Only the area around the ports"]
+        dom += ["Boundary: %s%s" % (
+            c["layer"], "" if c.get("axis_aligned", True) else " (bbox)")
+            for c in self._boundary_candidates]
+        self.domain = row(rg, "Domain:", wx.Choice(self, choices=dom))
+        self.domain.SetSelection(0)
+        self.domain.SetToolTip(
+            "Full board: the Edge.Cuts outline plus the margin and the "
+            "absorber.\n"
+            "Only the area around the ports: the box of the port pads plus "
+            "the margin and the absorber (F20).\n"
+            "Boundary: one closed rectangle on a user layer becomes the "
+            "core of the domain. The margin and the absorber go outside "
+            "it. Draw it with the rectangle tool, not on copper or "
+            "Edge.Cuts. A polygon, circle or rotated rectangle uses its "
+            "bounding box.")
         # A structure with a high Q rings for a long time. The run then
         # stops at the step limit before the energy decreases to the end
         # criteria, and the S-parameters are not correct. Before this, the
@@ -1125,7 +1171,7 @@ class SettingsDialog(wx.Dialog):
             for c in (self.f_stop, self.er):
                 c.Bind(wx.EVT_TEXT, self._on_preview_change)
             self.mesh.Bind(wx.EVT_CHOICE, self._on_preview_change)
-            self.subregion.Bind(wx.EVT_CHECKBOX, self._on_preview_change)
+            self.domain.Bind(wx.EVT_CHOICE, self._on_preview_change)
             self._redraw_preview()
         if self.para_rows:
             for _, cb, _, _, _ in self.para_rows:
@@ -1610,16 +1656,31 @@ class SettingsDialog(wx.Dialog):
             float(self.f_stop.GetValue()) * 1e9, eps,
             MESH_LEVELS[self.mesh.GetSelection()]))
 
+    def _domain_mode(self):
+        """Give "board", "ports" or "boundary" from the Domain choice."""
+        i = self.domain.GetSelection()
+        return "ports" if i == 1 else ("boundary" if i >= 2 else "board")
+
+    def _boundary_candidate(self):
+        """Give the candidate of the selected boundary, or None."""
+        i = self.domain.GetSelection() - 2
+        if 0 <= i < len(self._boundary_candidates):
+            return self._boundary_candidates[i]
+        return None
+
     def _redraw_preview(self):
         if self._prev_fig is None:
             return
         self._prev_fig.clear()
         ax = self._prev_fig.add_axes((0.01, 0.01, 0.98, 0.98))
+        cand = self._boundary_candidate()
         try:
             _draw_board(ax, self._preview_model, compact=True,
                         margin_mm=self.margin.GetValue(),
                         pml_mm=self._pml_mm(),
-                        subregion=self.subregion.GetValue(),
+                        subregion=(self._domain_mode() == "ports"),
+                        boundary_rect=(cand["rect"] if cand else None),
+                        boundary_label=(cand["layer"] if cand else None),
                         show_lumped=(not self.para_rows
                                      or self._any_modelled()))
         except Exception as e:  # the preview must not stop the dialog
@@ -1712,6 +1773,12 @@ class SettingsDialog(wx.Dialog):
             wx.MessageBox("%s is not installed: %s"
                           % (SOLVER_NAMES[self._solver_key()], why),
                           "RFsim", wx.ICON_ERROR)
+            return
+        if self._domain_mode() == "boundary" and not self._boundary_candidate():
+            wx.MessageBox(
+                "The Domain choice needs a closed rectangle on a user "
+                "layer.\nDraw one with the rectangle tool, or select the "
+                "full board.", "RFsim", wx.ICON_ERROR)
             return
         # **Each message names ONE field**, with the label that the dialog
         # shows. A single message for all the fields did not tell the user
@@ -2212,6 +2279,8 @@ class SettingsDialog(wx.Dialog):
 
     def get_settings(self):
         board = self.uses_board_stackup()
+        mode = self._domain_mode()
+        cand = self._boundary_candidate()
         return {
             "f_start": float(self.f_start.GetValue()) * 1e9,
             "f_stop": float(self.f_stop.GetValue()) * 1e9,
@@ -2226,7 +2295,10 @@ class SettingsDialog(wx.Dialog):
             "h": None if board else float(self.h.GetValue()),
             "cu_t": None if board else float(self.cu_t.GetValue()),
             "margin_mm": self.margin.GetValue(),
-            "subregion": self.subregion.GetValue(),
+            "domain": mode,
+            "boundary_layer": cand["layer"] if cand else None,
+            # Keep the old key for a reader of an older settings dict.
+            "subregion": mode == "ports",
             # "Auto" is item 0 and it gives None: the runner then reads the
             # cell count and selects the value. Item i gives i threads.
             "threads": self.threads.GetSelection() or None,
@@ -3547,7 +3619,7 @@ class ResultsFrame(wx.Frame):
         # board has no dimension, and it shows only the orientation. The
         # largest dimension of the board is about one half of the radius of
         # the balloon.
-        br = self.model["board_rect"]
+        br = self.model.get("board_outline") or self.model["board_rect"]
         cx, cy = 0.5 * (br["x0"] + br["x1"]), 0.5 * (br["y0"] + br["y1"])
         span = max(br["x1"] - br["x0"], br["y1"] - br["y0"], 1e-6)
         sc = 0.5 * m / span

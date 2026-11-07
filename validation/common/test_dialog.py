@@ -57,15 +57,29 @@ ROGERS = {
 }
 
 
-def dialog(extra=(), stackup=None, solvers=None):
+def _add_boundary(board, rect):
+    """Put one closed rectangle on User.4 (F40)."""
+    x0, y0, x1, y1 = rect
+    s = pcbnew.PCB_SHAPE(board, pcbnew.SHAPE_T_RECT)
+    s.SetLayer(pcbnew.User_4)
+    s.SetStart(pcbnew.VECTOR2I(pcbnew.FromMM(x0), pcbnew.FromMM(y0)))
+    s.SetEnd(pcbnew.VECTOR2I(pcbnew.FromMM(x1), pcbnew.FromMM(y1)))
+    board.Add(s)
+    return board
+
+
+def dialog(extra=(), stackup=None, solvers=None, boundary=None):
     """Give a dialog for the board of run_lumped_openems.py, which has one R.
 
     `extra` has more elements, for the tests of a part when the board does
     not give its type. `stackup` replaces the stackup keys of the preview,
     for the tests of the "KiCad's Stackup" preset. `solvers` is the state of
     the solvers that `rfsim._solver_state` gives; None: each one can run.
+    `boundary` is (x0, y0, x1, y1) of a rectangle on User.4.
     """
     board = pcbnew.LoadBoard(BOARD)
+    if boundary:
+        _add_boundary(board, boundary)
     pads = [p for fp in board.GetFootprints()
             if fp.GetReference() in ("P1", "P2") for p in fp.Pads()]
     assert len(pads) == 2, "the board must give the 2 pads of the ports"
@@ -870,9 +884,11 @@ def test_the_subregion_crops_the_domain():
     port pads plus the margin and the band, and not the full board."""
     d = dialog()
     assert d.get_settings()["subregion"] is False
-    d.subregion.SetValue(True)
-    fire(d.subregion, wx.EVT_CHECKBOX)       # the preview follows it
+    assert d.get_settings()["domain"] == "board"
+    d.domain.SetSelection(1)
+    fire(d.domain, wx.EVT_CHOICE)            # the preview follows it
     assert d.get_settings()["subregion"] is True
+    assert d.get_settings()["domain"] == "ports"
     d.Destroy()
 
     board = pcbnew.LoadBoard(BOARD)
@@ -893,6 +909,72 @@ def test_the_subregion_crops_the_domain():
     assert not any("area around the ports" in n for n in full["notes"])
     assert [e["ref"] for e in sub["lumped_elements"]] == ["R1"]
     print("the subregion OK (off by default, the box of the pads, a note)")
+
+
+def test_the_boundary_layer_crops_the_domain():
+    """F40: one closed rectangle on a user layer becomes the Domain choice.
+    `extract` uses it as the core, adds the margin and the PML, keeps the
+    ports, and refuses a port outside it or a boundary off the board."""
+    rect = (2.0, 4.0, 38.0, 16.0)
+    d = dialog(boundary=rect)
+    assert d.get_settings()["domain"] == "board"
+    assert d.get_settings()["boundary_layer"] is None
+    # Full board, ports, then one item for each candidate layer.
+    assert d.domain.GetCount() == 3, d.domain.GetCount()
+    assert d.domain.GetString(2).startswith("Boundary: ")
+    d.domain.SetSelection(2)
+    fire(d.domain, wx.EVT_CHOICE)            # the preview follows it
+    got = d.get_settings()
+    assert got["domain"] == "boundary" and got["subregion"] is False, got
+    assert got["boundary_layer"] == "User.4", got
+    d.Destroy()
+
+    board = pcbnew.LoadBoard(BOARD)
+    _add_boundary(board, rect)
+    pads = [p for fp in board.GetFootprints()
+            if fp.GetReference() in ("P1", "P2") for p in fp.Pads()]
+    pre = board_reader.extract(board, pads, 1.0)
+    assert [c["layer"] for c in pre["boundary_candidates"]] == ["User.4"]
+    core = pre["boundary_candidates"][0]["rect"]
+
+    mod = board_reader.extract(board, pads, 4.0, boundary="User.4")
+    r = mod["region"]
+    for k in ("x0", "x1", "y0", "y1"):
+        assert abs(r[k] - (core[k] - 8.0 if k in ("x0", "y0")
+                           else core[k] + 8.0)) < 1e-3, (k, r, core)
+    assert mod["boundary"]["layer"] == "User.4"
+    assert mod["boundary"]["rect"] == core
+    assert any("simulation boundary" in n for n in mod["notes"]), mod["notes"]
+    assert not any("simulation boundary" in n for n in
+                   board_reader.extract(board, pads, 4.0)["notes"])
+
+    pml = board_reader.solverenv.pml_depth(board_reader.solverenv.mesh_res(
+        6e9, max(d["epsilon"] for d in mod["dielectric_layers"]), "medium"))
+    mod2 = board_reader.extract(board, pads, 4.0, f_stop=6e9, mesh="medium",
+                                boundary="User.4")
+    r2 = mod2["region"]
+    d2 = 4.0 + pml
+    for k in ("x0", "x1", "y0", "y1"):
+        assert abs(r2[k] - (core[k] - d2 if k in ("x0", "y0")
+                            else core[k] + d2)) < 1e-3, (k, r2, core, pml)
+    assert abs(mod2["pml_mm"] - pml) < 1e-6
+
+    # A pad outside the boundary is refused, with the port in the message.
+    # The headless rect is in the model coordinates (mm, y up).
+    try:
+        board_reader.extract(board, pads, 4.0, boundary=(10, -16, 30, -4))
+    except ValueError as e:
+        assert "outside the simulation boundary" in str(e), e
+    else:
+        raise AssertionError("a port outside the boundary was accepted")
+    # A boundary that does not overlap the board is refused.
+    try:
+        board_reader.extract(board, pads, 4.0, boundary=(50, 50, 60, 60))
+    except ValueError as e:
+        assert "does not overlap the board" in str(e), e
+    else:
+        raise AssertionError("a boundary off the board was accepted")
+    print("the boundary layer OK (choice, core, PML, port and overlap checks)")
 
 
 def test_the_kicad_stackup_preset_gives_the_board():
@@ -1507,6 +1589,7 @@ if __name__ == "__main__":
     test_the_solver_choice_reaches_the_settings()
     test_a_missing_solver_is_greyed_out()
     test_the_subregion_crops_the_domain()
+    test_the_boundary_layer_crops_the_domain()
     test_the_kicad_stackup_preset_gives_the_board()
     test_the_x_of_the_dialog_does_not_start_the_run()
     test_a_series_rlc_row_shows_r_l_and_c_and_no_parasitics()

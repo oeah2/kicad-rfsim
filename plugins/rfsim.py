@@ -195,12 +195,28 @@ class RFSimPlugin(pcbnew.ActionPlugin):
         # `f_stop` and `mesh` set the dimension of the PML band. Thus the
         # domain holds the clear air AND the absorber: refer to
         # `solverenv.pml_depth`.
+        #
+        # F40: "domain" is "board", "ports" (F20) or "boundary". An older
+        # settings dict has only "subregion"; it keeps the old meaning.
+        domain = settings.get("domain") or (
+            "ports" if settings.get("subregion") else "board")
+        boundary = (settings.get("boundary_layer")
+                    if domain == "boundary" else None)
+        if domain == "boundary" and not boundary:
+            raise ValueError(
+                "The Domain choice is a drawn boundary, but no boundary "
+                "layer is in the settings. Select the layer again.")
         model = board_reader.extract(board, pads, settings["margin_mm"],
                                      substrate, live_stackup=live,
                                      f_stop=settings["f_stop"],
                                      mesh=settings["mesh"],
-                                     subregion=settings.get("subregion",
-                                                            False))
+                                     subregion=(domain == "ports"),
+                                     boundary=boundary)
+        # Keep the choice in model.json, including the old "subregion"
+        # key, so a reader sees how the domain was made.
+        settings["domain"] = domain
+        settings["boundary_layer"] = boundary
+        settings["subregion"] = domain == "ports"
         for e in model["lumped_elements"]:
             v = para.get(e["ref"])
             if v:

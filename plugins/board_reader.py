@@ -48,6 +48,12 @@ except ImportError:                      # run as a top-level module
 #      as a lumped port from the pad to the adjacent layer. That port
 #      drives the pad against its own ring on that layer, and the run
 #      gives a number with no message.
+#
+# **2026-11-07: the version stays 4 for a drawn simulation boundary.** The
+# new "boundary" and "boundary_candidates" keys are optional, and the
+# "region", "board_rect" and "pml_mm" keys keep their meaning. A previous
+# runner reads the smaller region and puts its PML band at the same place;
+# it does not need the new keys.
 MODEL_VERSION = 4
 
 # the default values if the board has no stackup: FR4
@@ -1223,13 +1229,172 @@ def _port(board, pad, number, copper_layers):
     }
 
 
+def _rect_mm(box):
+    """Give a BOX2I as a model rect: mm, and the y axis points up."""
+    return {"x0": _mm(box.GetLeft()), "x1": _mm(box.GetRight()),
+            "y0": -_mm(box.GetBottom()), "y1": -_mm(box.GetTop())}
+
+
+def _rect_box(rect):
+    """Give a model rect (mm, y up) as a BOX2I in the coordinates of KiCad.
+
+    `rect` is a dict with x0/x1/y0/y1, or a sequence (x0, y0, x1, y1).
+    """
+    try:
+        if isinstance(rect, dict):
+            x0, x1 = float(rect["x0"]), float(rect["x1"])
+            y0, y1 = float(rect["y0"]), float(rect["y1"])
+        else:
+            x0, y0, x1, y1 = (float(v) for v in rect)
+    except (KeyError, TypeError, ValueError):
+        raise ValueError(
+            "The simulation boundary must have the numbers x0, x1, y0 "
+            "and y1, in mm")
+    if not (x0 < x1 and y0 < y1):
+        raise ValueError(
+            "The simulation boundary is empty. Its x0 must be less than "
+            "its x1, and its y0 less than its y1.")
+    return pcbnew.BOX2I.ByCorners(
+        pcbnew.VECTOR2I(pcbnew.FromMM(x0), pcbnew.FromMM(-y1)),
+        pcbnew.VECTOR2I(pcbnew.FromMM(x1), pcbnew.FromMM(-y0)))
+
+
+def _shape_box(shape):
+    """Give the centerline box of one closed drawing: (box, axis_aligned).
+
+    None gives a drawing that is not a closed rectangle, circle or polygon.
+    `axis_aligned` is True only for an axis-aligned rectangle. A polygon, a
+    circle or a rotated rectangle is used as its bounding box.
+    """
+    kind = shape.GetShape()
+    if kind == pcbnew.SHAPE_T_RECT:
+        pts = list(shape.GetRectCorners())
+    elif kind == pcbnew.SHAPE_T_CIRCLE:
+        c, r = shape.GetCenter(), shape.GetRadius()
+        pts = [pcbnew.VECTOR2I(c.x - r, c.y - r),
+               pcbnew.VECTOR2I(c.x + r, c.y + r)]
+    elif kind == pcbnew.SHAPE_T_POLY:
+        ps = shape.GetPolyShape()
+        if not shape.IsClosed() or ps.OutlineCount() != 1:
+            return None
+        ol = ps.Outline(0)
+        pts = [ol.CPoint(i) for i in range(ol.PointCount())]
+    else:
+        return None
+    if not pts:
+        return None
+    xs = {p.x for p in pts}
+    ys = {p.y for p in pts}
+    box = pcbnew.BOX2I.ByCorners(
+        pcbnew.VECTOR2I(min(xs), min(ys)),
+        pcbnew.VECTOR2I(max(xs), max(ys)))
+    axis = kind == pcbnew.SHAPE_T_RECT and len(xs) == 2 and len(ys) == 2
+    if kind == pcbnew.SHAPE_T_POLY:
+        axis = len(pts) == 4 and len(xs) == 2 and len(ys) == 2
+    return box, axis
+
+
+def boundary_candidates(board):
+    """Give the closed rectangle on each user layer, as model rects.
+
+    A user layer with exactly one closed drawing is a candidate. Text, open
+    segments and a layer with more than one closed drawing are not. The
+    drawing is read at its centerline, and not at the width of its stroke.
+    """
+    by_layer = {}
+    for d in board.GetDrawings():
+        if not isinstance(d, pcbnew.PCB_SHAPE):
+            continue
+        lid = d.GetLayer()
+        if not pcbnew.IsUserLayer(lid):
+            continue
+        got = _shape_box(d)
+        if got:
+            by_layer.setdefault(lid, []).append(got)
+    out = []
+    for lid, items in sorted(by_layer.items()):
+        if len(items) != 1:  # one rectangle per layer keeps the choice clear
+            continue
+        box, axis = items[0]
+        out.append({
+            "layer": board.GetLayerName(lid),
+            "standard": board.GetStandardLayerName(lid),
+            "rect": _rect_mm(box),
+            "axis_aligned": bool(axis),
+        })
+    return out
+
+
+def _boundary_box(board, boundary, candidates=None):
+    """Give (BOX2I, candidate) of a boundary layer name or a model rect.
+
+    `boundary` is the name of a user layer with one closed rectangle, or a
+    dict with x0, x1, y0 and y1, or a sequence (x0, y0, x1, y1), in mm
+    (y up). The candidate is None for a rect. A name that has no single
+    closed rectangle stops the run with a message that names the layers
+    that have one.
+    """
+    if isinstance(boundary, dict) or (
+            isinstance(boundary, (tuple, list)) and len(boundary) == 4):
+        return _rect_box(boundary), None
+    cands = boundary_candidates(board) if candidates is None else candidates
+    for c in cands:
+        if boundary in (c["layer"], c["standard"]):
+            return _rect_box(c["rect"]), c
+    names = ", ".join(c["layer"] for c in cands) or "none"
+    raise ValueError(
+        "No closed rectangle is on the simulation boundary layer %r.\n"
+        "Draw one closed rectangle with the rectangle tool on a user "
+        "layer, or select the full board. Layers that have one: %s."
+        % (boundary, names))
+
+
+def _count_crossing(board, box, copper_layers):
+    """Give {layer name: count} of the copper items that cross `box`.
+
+    The count is for the note only. Zones are not counted, as in
+    `_copper_polys`. A drawing that is entirely out of the box is not a
+    crossing.
+    """
+    out = {}
+    for c in copper_layers:
+        lid, n = c["id"], 0
+
+        def count(item):
+            nonlocal n
+            bb = item.GetBoundingBox()
+            if not (item.IsOnLayer(lid) and bb.Intersects(box)):
+                return
+            if not (bb.GetLeft() >= box.GetLeft()
+                    and bb.GetRight() <= box.GetRight()
+                    and bb.GetTop() >= box.GetTop()
+                    and bb.GetBottom() <= box.GetBottom()):
+                n += 1
+
+        for t in board.GetTracks():
+            count(t)
+        for d in board.GetDrawings():
+            if isinstance(d, pcbnew.PCB_SHAPE):
+                count(d)
+        for fp in board.GetFootprints():
+            for pad in fp.Pads():
+                count(pad)
+            for it in fp.GraphicalItems():
+                if isinstance(it, pcbnew.PCB_SHAPE):
+                    count(it)
+        if n:
+            out[c["name"]] = n
+    return out
+
+
 def extract(board, pads, margin_mm, substrate=None, live_stackup=False,
-            f_stop=None, mesh=None, subregion=False):
+            f_stop=None, mesh=None, subregion=False, boundary=None):
     """Change a board into a dict: stackup, copper polygons, vias, ports.
 
-    The function crops the geometry to the bounding box of the port pads
-    plus margin_mm. The coordinates are in mm, the y axis points up, and
-    z=0 is at the bottom of the board. If you give `substrate`, it replaces
+    The function crops the geometry to the core box: the bounding box of
+    the port pads, the full board, or a drawn boundary, plus margin_mm. The
+    coordinates are in mm, the y axis points up, and z=0 is at the bottom
+    of the board. If you give `substrate`, it replaces
     the stackup of the board with a stackup that has the same values in all
     layers. Its keys are "er", "tand", "h" (the total dielectric thickness
     in mm) and "cu_t" (in mm). With no `substrate`, the stackup comes from
@@ -1246,14 +1411,24 @@ def extract(board, pads, margin_mm, substrate=None, live_stackup=False,
     `subregion` (F20) makes the domain only the box of the port pads, and
     not the full board. The copper, the vias and the R/L/C parts out of
     it are not in the model, because each of them tests `region`.
+
+    `boundary` is the name of a user layer with one closed rectangle, or a
+    dict with "x0", "x1", "y0" and "y1", or a sequence (x0, y0, x1, y1),
+    in mm (y up). It makes the domain that rectangle plus `margin_mm` and
+    the PML band, and not the full board. Every port pad must be inside the
+    rectangle, and the rectangle must overlap the board. A boundary is more
+    important than `subregion`. The copper and the substrate that cross the
+    rectangle continue into the absorber, as they do at the edge of a
+    subregion.
     """
     copper_layers, diel_layers, stack_src = _stackup(board, substrate,
                                                      live_stackup)
+    candidates = boundary_candidates(board)
 
     first = pads[0].GetBoundingBox()
-    region = pcbnew.BOX2I(first.GetPosition(), first.GetSize())
+    core = pcbnew.BOX2I(first.GetPosition(), first.GetSize())
     for p in pads[1:]:
-        region.Merge(p.GetBoundingBox())
+        core.Merge(p.GetBoundingBox())
     # Fit the domain to the full board (Edge.Cuts). Before, a domain with
     # the dimensions of the pad bbox cut the antennas. ponytail: the domain
     # is the full board. Use the bbox of the selection again if very large
@@ -1263,9 +1438,40 @@ def extract(board, pads, margin_mm, substrate=None, live_stackup=False,
     # board of GitHub PR #6 it decreased 564 polygons to 142, 258 vias to 98 and
     # 44 parts to 12. The copper that its edge cuts ends in the absorber,
     # as at the edge of the full domain.
+    #
+    # **A drawn boundary (F40) is the same mechanism with a user box.** It
+    # must contain every port, or the port excitation is cut. It may extend
+    # past the board edge on a side where the user wants air, but it must
+    # overlap the board.
     brd = board.GetBoardEdgesBoundingBox()
-    if not subregion and brd.GetWidth() > 0 and brd.GetHeight() > 0:
-        region.Merge(brd)
+    boundary_rec = None
+    bname = None
+    if boundary is not None:
+        core, bname = _boundary_box(board, boundary, candidates)
+        if (brd.GetWidth() > 0 and brd.GetHeight() > 0
+                and not core.Intersects(brd)):
+            raise ValueError(
+                "The simulation boundary does not overlap the board.\n"
+                "Move the boundary over the board, or select the full "
+                "board.")
+        for i, pad in enumerate(pads, 1):
+            if not core.Contains(pad.GetBoundingBox()):
+                fp = pad.GetParentFootprint()
+                raise ValueError(
+                    "Port %d (%s Pad %s): the pad is outside the "
+                    "simulation boundary%s.\nThe boundary must contain "
+                    "every port, because the port excites the pad against "
+                    "the adjacent layer. Move the boundary, or use the "
+                    "full board."
+                    % (i, fp.GetReference(), pad.GetNumber(),
+                       " on %s" % bname["layer"] if bname else ""))
+        boundary_rec = {
+            "layer": bname["layer"] if bname else None,
+            "standard": bname["standard"] if bname else None,
+            "rect": _rect_mm(core),
+        }
+    elif not subregion and brd.GetWidth() > 0 and brd.GetHeight() > 0:
+        core.Merge(brd)
     # **The margin of clear air PLUS the depth of the PML band.** The inner
     # band is clear air and the outer band is the absorber. The code crops
     # the copper at the outer edge. Thus the cut planes and tracks go
@@ -1282,16 +1488,18 @@ def extract(board, pads, margin_mm, substrate=None, live_stackup=False,
         eps_max = max(d["epsilon"] for d in diel_layers)
         pml_mm = solverenv.pml_depth(
             solverenv.mesh_res(f_stop, eps_max, mesh))
+    region = pcbnew.BOX2I(core.GetPosition(), core.GetSize())
     region.Inflate(pcbnew.FromMM(margin_mm + pml_mm))
 
     brd_box = board.GetBoardEdgesBoundingBox()
     diel_box = region.Intersect(brd_box)
     if diel_box.GetWidth() <= 0 or diel_box.GetHeight() <= 0:
+        if boundary is not None:
+            raise ValueError(
+                "The simulation boundary does not overlap the board.\n"
+                "Move the boundary over the board, or select the full "
+                "board.")
         diel_box = region
-
-    def rect_mm(b):
-        return {"x0": _mm(b.GetLeft()), "x1": _mm(b.GetRight()),
-                "y0": -_mm(b.GetBottom()), "y1": -_mm(b.GetTop())}
 
     polygons = {}
     clipped = {}
@@ -1301,6 +1509,8 @@ def extract(board, pads, margin_mm, substrate=None, live_stackup=False,
             polygons[c["name"]] = polys
         if n_clip:
             clipped[c["name"]] = n_clip
+    crossing = (_count_crossing(board, core, copper_layers)
+                if boundary is not None else {})
 
     warnings = []
     if clipped:
@@ -1308,8 +1518,9 @@ def extract(board, pads, margin_mm, substrate=None, live_stackup=False,
             "Copper on %s goes across the edge of the simulation domain, "
             "and RFsim cuts it there. If this copper is a part of the "
             "structure, increase the domain margin%s."
-            % ("/".join(clipped), ", or use the full board" if subregion
-               else ""))
+            % ("/".join(clipped),
+               ", or enlarge the simulation boundary" if boundary is not None
+               else (", or use the full board" if subregion else "")))
 
     z_of = {c["name"]: c["z"] for c in copper_layers}
     vias = []
@@ -1334,7 +1545,7 @@ def extract(board, pads, margin_mm, substrate=None, live_stackup=False,
     # on the side of the connector. The default side is the side of the
     # footprint, when that side has a gap. The dialog lets the user select
     # the other side.
-    brect = rect_mm(diel_box)
+    brect = _rect_mm(diel_box)
     centre = (0.5 * (brect["x0"] + brect["x1"]),
               0.5 * (brect["y0"] + brect["y1"]))
     for p, pad in zip(ports, pads):
@@ -1471,7 +1682,43 @@ def extract(board, pads, margin_mm, substrate=None, live_stackup=False,
                                               port_refs)
     warnings += le_warn
     notes = ref_notes + notes
-    if subregion:
+    if boundary is not None:
+        n_vias = sum(1 for t in board.GetTracks()
+                     if isinstance(t, pcbnew.PCB_VIA))
+        n_fps = len(board.GetFootprints())
+        n_in = sum(1 for fp in board.GetFootprints()
+                   if fp.GetBoundingBox().Intersects(region))
+        r = _rect_mm(region)
+        name = (" on %s" % bname["layer"] if bname else "")
+        notes.insert(0, "The domain is the simulation boundary%s plus the "
+                        "margin and the absorber: %.1f x %.1f mm; %d of %d "
+                        "vias and %d of %d footprints are in it"
+                     % (name, r["x1"] - r["x0"], r["y1"] - r["y0"],
+                        len(vias), n_vias, n_in, n_fps))
+        if brd_box.GetWidth() > 0 and brd_box.GetHeight() > 0:
+            past = []
+            if region.GetLeft() < brd_box.GetLeft():
+                past.append("left")
+            if region.GetRight() > brd_box.GetRight():
+                past.append("right")
+            if region.GetBottom() > brd_box.GetBottom():
+                past.append("bottom")
+            if region.GetTop() < brd_box.GetTop():
+                past.append("top")
+            if past:
+                notes.append(
+                    "The simulation domain extends past the board edge on "
+                    "the %s side(s). The board edge is a part of the model "
+                    "there. To truncate through the board, keep the "
+                    "boundary at least the margin plus the absorber depth "
+                    "inside the edge." % ", ".join(past))
+        if crossing:
+            items = ", ".join("%s: %d" % (k, v) for k, v in crossing.items())
+            notes.append(
+                "Copper crosses the simulation boundary (%s). It runs into "
+                "the absorber there. If this copper is part of the "
+                "structure, enlarge the boundary." % items)
+    elif subregion:
         n_vias = sum(1 for t in board.GetTracks()
                      if isinstance(t, pcbnew.PCB_VIA))
         n_fps = len(board.GetFootprints())
@@ -1490,11 +1737,17 @@ def extract(board, pads, margin_mm, substrate=None, live_stackup=False,
         "stackup_source": stack_src,
         "copper_layers": copper_layers,
         "dielectric_layers": diel_layers,
-        "region": rect_mm(region),
+        "region": _rect_mm(region),
         # The depth of one PML band, in the region on each face. The clear
         # air between the structure and the band is margin_mm.
         "pml_mm": pml_mm,
-        "board_rect": rect_mm(diel_box),
+        "board_rect": _rect_mm(diel_box),
+        # The full outline, for the preview when board_rect is a crop.
+        "board_outline": _rect_mm(brd_box),
+        # None, or the rectangle that made the core of the domain.
+        "boundary": boundary_rec,
+        # The user layers that can become a boundary, for the dialog.
+        "boundary_candidates": candidates,
         "polygons": polygons,
         "vias": vias,
         "ports": ports,
@@ -1828,3 +2081,59 @@ if __name__ == "__main__":  # self-test of the value parser: python board_reader
         assert bool(_msg) == _warn, \
             "%s -> warning %r, want %s" % (_name, _msg, _warn)
     print("package OK (%d cases)" % len(_PKGS))
+
+    # F40: the closed rectangle on a user layer that becomes the domain.
+    _B = pcbnew.BOARD()
+
+    def _draw_rect(board, layer, x0, y0, x1, y1):
+        s = pcbnew.PCB_SHAPE(board, pcbnew.SHAPE_T_RECT)
+        s.SetLayer(layer)
+        s.SetStart(pcbnew.VECTOR2I(pcbnew.FromMM(x0), pcbnew.FromMM(y0)))
+        s.SetEnd(pcbnew.VECTOR2I(pcbnew.FromMM(x1), pcbnew.FromMM(y1)))
+        board.Add(s)
+        return s
+
+    assert boundary_candidates(_B) == []
+    _draw_rect(_B, pcbnew.User_4, 2.0, 4.0, 38.0, 16.0)
+    _got = boundary_candidates(_B)
+    assert len(_got) == 1 and _got[0]["layer"] == "User.4", _got
+    assert _got[0]["axis_aligned"] is True
+    assert _got[0]["rect"] == {"x0": 2.0, "x1": 38.0,
+                               "y0": -16.0, "y1": -4.0}, _got[0]
+    # A line on the layer is not a closed shape, thus it does not count.
+    _line = pcbnew.PCB_SHAPE(_B, pcbnew.SHAPE_T_SEGMENT)
+    _line.SetLayer(pcbnew.User_4)
+    _line.SetStart(pcbnew.VECTOR2I(pcbnew.FromMM(0), pcbnew.FromMM(0)))
+    _line.SetEnd(pcbnew.VECTOR2I(pcbnew.FromMM(5), pcbnew.FromMM(5)))
+    _B.Add(_line)
+    assert len(boundary_candidates(_B)) == 1
+    # A second closed shape on the same layer makes the layer ambiguous.
+    _draw_rect(_B, pcbnew.User_4, 0.0, 0.0, 10.0, 10.0)
+    assert boundary_candidates(_B) == []
+    # A circle and a polygon are candidates, but only as their bbox.
+    _draw_rect(_B, pcbnew.User_1, 1.0, 1.0, 9.0, 7.0)
+    _circle = pcbnew.PCB_SHAPE(_B, pcbnew.SHAPE_T_CIRCLE)
+    _circle.SetLayer(pcbnew.User_2)
+    _circle.SetCenter(pcbnew.VECTOR2I(pcbnew.FromMM(5), pcbnew.FromMM(5)))
+    _circle.SetRadius(pcbnew.FromMM(3))
+    _B.Add(_circle)
+    _got = {c["layer"]: c for c in boundary_candidates(_B)}
+    assert set(_got) == {"User.1", "User.2"}, _got
+    assert _got["User.1"]["axis_aligned"] is True
+    assert _got["User.2"]["axis_aligned"] is False
+    assert _got["User.2"]["rect"] == {"x0": 2.0, "x1": 8.0,
+                                      "y0": -8.0, "y1": -2.0}, _got["User.2"]
+    # A dict is the headless form of the boundary.
+    _rect = {"x0": 2.0, "x1": 38.0, "y0": -16.0, "y1": -4.0}
+    _box, _cand = _boundary_box(_B, _rect)
+    assert _cand is None and _rect_mm(_box) == _rect, _rect_mm(_box)
+    _box, _cand = _boundary_box(_B, "User.1")
+    assert _cand and _cand["layer"] == "User.1", _cand
+    try:
+        _boundary_box(_B, "User.4")
+    except ValueError as _e:
+        assert "No closed rectangle" in str(_e), _e
+    else:
+        raise AssertionError("an ambiguous boundary layer was accepted")
+    assert MODEL_VERSION == solverenv.MODEL_VERSION == 4
+    print("boundary OK (rect, line, ambiguity, circle, dict, missing layer)")
