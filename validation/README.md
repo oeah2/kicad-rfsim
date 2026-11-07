@@ -71,6 +71,8 @@ The self-resonance of an inductor on an 0402 land. The |S21| notch must be at 1/
 A series capacitor of 1, 0.5 and 2 pF as three states. The S21 phase difference to the first state must be within 3° of the closed form.
 * **`run_probe_*.py [mesh] [all|single|dual]`**  
 A patch fed from below through a plated hole (coaxial feed port). One feed must give the resonance within 6% of the closed form, and the resistance of a probe from the plane to the patch. Two feeds must give 15 dB or more of isolation and XPD.
+* **`test_cudss_gate.py`**
+The memory gate of the cuDSS solver, with the estimates of three real runs. It needs no board and no GPU.
 
 ## openEMS tests (`openems\`)
 
