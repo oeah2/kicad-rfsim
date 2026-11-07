@@ -91,7 +91,7 @@ SWEEP_GROUP = 15
 # that is available now, thus this value is a ceiling and not a promise.
 # A factorization above this budget stops with "[rfsim] ERROR: cuDSS needs
 # ..."; reduce the mesh or raise this constant.
-CUDSS_HOST_LIMIT_GB = 13
+CUDSS_HOST_LIMIT_GB = 15
 # The system RAM kept free for the OS and for the arrays of EMerge, in GiB.
 # cuDSS pins its host factors, thus that memory cannot be swapped out.
 CUDSS_HOST_HEADROOM_GB = 1
@@ -558,28 +558,53 @@ def _cudss_estimates(iface, cudss):
                getattr(iface, "_rfsim_device_limit", 0) / 1024**3))
 
 
-def _cudss_device_limit(iface):
+def _cudss_device_limit(iface, churn=False):
     """Give the VRAM budget for cuDSS after the analysis phase.
 
     **The budget is measured now, not at the start of the run.** The
     analysis of cuDSS keeps device memory of its own, and EMerge submits A
     again for the numeric phase. A budget from `_rfsim_free_init` would
     accept a factorization that no longer fits. **The free VRAM already
-    holds A, b, x and the symbolic data**, thus the reserve is only the
-    fixed headroom of `CUDSS_DEVICE_HEADROOM_MB` for the transient copy of
-    A and for the fragmentation of the pool; the numeric phase returns the
-    unused blocks of CuPy to the driver first (`numeric`).
+    holds A, b, x and the symbolic data**, thus the reserve is the fixed
+    headroom of `CUDSS_DEVICE_HEADROOM_MB` for the fragmentation of the
+    pool; the numeric phase returns the unused blocks of CuPy to the
+    driver first (`numeric`).
+
+    **With `churn` the budget also pays for the matrix that EMerge
+    uploads again at every numeric phase.** The old A stays referenced
+    while the new one is built: the failed run of 142,547 tets died with
+    2.09 GiB of CuPy arrays live *on top of* its full hybrid grant. The
+    estimate of a device-only factorization already carries cuDSS's own
+    transient workspace, so only the hybrid grant reserves the two extra
+    copies of A.
     """
     import cupy as cp
+
+    def nbytes(name):
+        v = getattr(iface, name, None)
+        return 0 if v is None else int(v.nbytes)
+
+    if churn:
+        # A is the values, the CSR indices, and the int32 copy of the
+        # column indices that cudss.py makes for cuDSS. Count both index
+        # arrays; the row pointer is small compared with them. Two copies
+        # stand for the old A and its new upload; `A_cu` itself is not
+        # much larger, and the headroom floor of 256 MiB covers the rest.
+        a = sum(nbytes(name) for name in ("_VAL", "_IND", "_COL_IDS",
+                                          "_INDPTR"))
+        reserve = max(CUDSS_DEVICE_HEADROOM_MB * 1024**2,
+                      2 * a + nbytes("b_cu") + nbytes("x_cu")
+                      + 64 * 1024**2)
+    else:
+        reserve = CUDSS_DEVICE_HEADROOM_MB * 1024**2
     free, total = cp.cuda.runtime.memGetInfo()
     iface._rfsim_device_free = int(free)
     iface._rfsim_device_total = int(total)
-    reserve = CUDSS_DEVICE_HEADROOM_MB * 1024**2
     limit = int(free) - reserve
     if limit < 64 * 1024**2:
         raise SystemExit(
             "[rfsim] ERROR: only %.0f MiB of VRAM is free after the "
-            "analysis (headroom %.0f MiB); cuDSS has no room for its "
+            "analysis (reserve %.0f MiB); cuDSS has no room for its "
             "factors. Free the GPU or reduce the mesh."
             % (max(free, 0) / 1024**2, reserve / 1024**2))
     return limit
@@ -694,13 +719,14 @@ def _cudss_hybrid():
     estimate. Only a matrix whose factors do not fit in the VRAM that is
     free after that analysis is re-analysed with CUDSS_CONFIG_HYBRID_MODE,
     because that mode keeps the whole factor set in host RAM, not just the
-    overflow. **The device budget is measured after each analysis**, thus
-    the symbolic data of cuDSS and the copy of A that the numeric phase
-    submits are not counted as free. The host budget is the RAM available
-    now, less a headroom, and `CUDSS_HOST_LIMIT_GB` is its ceiling. **The
-    gate judges the first matrix of the sweep**; the later frequencies
-    REFACTORIZE into the factor storage allocated from that analysis, so a
-    frequency whose fill-in grows past the estimate is not caught.
+    overflow. **The device budget is measured after each analysis**, and
+    the hybrid grant also reserves two copies of A: cuDSS fills its device
+    limit while EMerge uploads the next matrix for the numeric phase. The
+    host budget is the RAM available now, less a headroom, and
+    `CUDSS_HOST_LIMIT_GB` is its ceiling. **The gate judges the first
+    matrix of the sweep**; the later frequencies REFACTORIZE into the
+    factor storage allocated from that analysis, so a frequency whose
+    fill-in grows past the estimate is not caught.
 
     Give None, or the cause when this EMerge cannot use the hybrid mode.
     """
@@ -786,25 +812,25 @@ def _cudss_hybrid():
             _cudss_gate(self)
             self._rfsim_gate_pending = True
             return
+        # The factors do not fit. Re-analyse with hybrid memory, which
+        # keeps the whole factor set in host RAM. The grant now pays for
+        # the churn as well: cuDSS fills its device limit while EMerge
+        # uploads the next A, so the two live at the same time.
+        self._rfsim_hybrid_state = "on"
+        self._rfsim_estimates = None
+        before = _cudss_device_limit(self, churn=True)
         # The hybrid mode has its own minimum. Field 4 of the device-only
         # estimate is the same value as HYBRID_DEVICE_MEMORY_MIN; checking
         # it here avoids a re-analysis that cannot report its estimate.
         min_dev = int(est[4])
-        if min_dev > self._rfsim_device_limit:
+        if min_dev > before:
             raise SystemExit(
                 "[rfsim] ERROR: cuDSS hybrid mode needs at least %.2f GiB "
                 "of device memory, but only %.2f GiB is free after the "
-                "analysis. Free the GPU or reduce the mesh."
-                % (min_dev / 1024**3,
-                   self._rfsim_device_limit / 1024**3))
-        # The factors do not fit. Re-analyse with hybrid memory, which
-        # keeps the whole factor set in host RAM. The limit is the device
-        # memory that is free after the analysis; it is set before this
-        # analysis so that the estimate of the host side belongs to it,
-        # and lowered below if the analysis keeps more.
-        self._rfsim_hybrid_state = "on"
-        self._rfsim_estimates = None
-        before = self._rfsim_device_limit
+                "analysis with the matrix churn reserved. Free the GPU or "
+                "reduce the mesh."
+                % (min_dev / 1024**3, before / 1024**3))
+        self._rfsim_device_limit = before
         config(self, "HYBRID_MODE", 1)
         config(self, "HYBRID_DEVICE_MEMORY_LIMIT", before)
         try:
@@ -814,7 +840,7 @@ def _cudss_hybrid():
                 "[rfsim] ERROR: cuDSS failed the hybrid analysis (%s: %s) "
                 "with a device budget of %.2f GiB. Reduce the mesh or free "
                 "the GPU." % (type(e).__name__, e, before / 1024**3))
-        limit = _cudss_device_limit(self)
+        limit = _cudss_device_limit(self, churn=True)
         self._rfsim_device_limit = min(before, limit)
         if self._rfsim_device_limit < before:
             config(self, "HYBRID_DEVICE_MEMORY_LIMIT",
