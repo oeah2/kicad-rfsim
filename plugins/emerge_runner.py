@@ -35,6 +35,7 @@ The limits of this model:
   box and a first-order absorber do not change it. A larger face moves
   the lowest value to a lower frequency.
 """
+import gc
 import glob
 import json
 import os
@@ -463,6 +464,70 @@ def _mode_search(mw, neff):
     mw.modal_analysis = modal
 
 
+class _CudssHostRam(Exception):
+    """cuDSS has no room for its host factors with the group in memory.
+
+    **EMerge holds all the matrices of a frequency group at once**, so
+    the RAM that the host factors need depends on the count of the
+    group. The gate of `_cudss_gate` raises this instead of stopping the
+    run; `main` retries the sweep with a smaller group. The gate leaves
+    its numbers in `_cudss_last_short` so that the retry can size the
+    group from the RAM that the freed group gives back.
+    """
+
+
+_cudss_last_short = {}
+
+
+def _cudss_host_avail():
+    """Give the system RAM that is free now, in bytes, or None."""
+    try:
+        import psutil
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        return None
+
+
+def _cudss_forget_matrices():
+    """Give the VRAM of the last cuDSS matrices back to the card.
+
+    **EMerge's `CuDSSInterface` is a singleton whose `clear_memory()` is
+    an empty stub**, so the device arrays of an attempt that the gate
+    stopped stay allocated. The retry of the sweep measures the free
+    VRAM again, and it must not count the dead arrays of the failed
+    attempt as the room of the factors.
+
+    **When the interface cannot be reached the retry loses about 0.8
+    GiB of its VRAM budget**, and the run may drift into the hybrid
+    mode with no hint why, so a failure here is said, not swallowed.
+    """
+    try:
+        from emerge._emerge.solvers.cudss import CuDSSInterface
+        iface = CuDSSInterface._instances.get(CuDSSInterface)
+    except Exception as e:
+        say("WARNING: cuDSS interface not found (%s: %s); the dead device "
+            "arrays of the failed attempt may keep their VRAM."
+            % (type(e).__name__, e))
+        return
+    if iface is None:
+        return
+    held = 0
+    for name in ("A_cu", "b_cu", "x_cu", "_VAL", "_IND", "_COL_IDS",
+                 "_INDPTR", "_ROW_START", "_ROW_END"):
+        try:
+            if getattr(iface, name, None) is not None:
+                held += 1
+            setattr(iface, name, None)
+        except Exception:
+            pass
+    if held == 0 and getattr(iface, "_rfsim_estimates", None) is not None:
+        say("WARNING: the cuDSS interface holds no known device arrays "
+            "after a solved analysis; its names may have changed, and the "
+            "retry may see less free VRAM.")
+    iface._factorized = False
+    iface._rfsim_gate_pending = False
+
+
 def _cudss_estimates(iface, cudss):
     """Give the cuDSS memory estimates after the analysis phase.
 
@@ -530,10 +595,8 @@ def _cudss_host_budget():
     when psutil is not present.
     """
     cap = CUDSS_HOST_LIMIT_GB * 1024**3
-    try:
-        import psutil
-        avail = int(psutil.virtual_memory().available)
-    except Exception:
+    avail = _cudss_host_avail()
+    if avail is None:
         return cap, None
     return min(cap, max(0, avail - CUDSS_HOST_HEADROOM_GB * 1024**3)), avail
 
@@ -599,19 +662,28 @@ def _cudss_gate(iface):
         "RAM (%s)" % (limit / 1024**3, total / 1024**3,
                       free_dev / 1024**3, peak_host / 1024**3, host_tail))
     if peak_host > host_budget:
-        if (host_avail is not None
-                and host_budget >= CUDSS_HOST_LIMIT_GB * 1024**3):
-            cause = ("The %.0f GiB cap of CUDSS_HOST_LIMIT_GB is the limit; "
-                     "raise it, free the GPU (so the factors fit in VRAM), "
-                     "or use a coarser mesh." % CUDSS_HOST_LIMIT_GB)
-        else:
-            cause = ("Lower settings[\"fem_group\"] in model.json (the group "
-                     "matrices are held in RAM), close other programs, or use "
-                     "a coarser mesh.")
-        raise SystemExit(
-            "[rfsim] ERROR: cuDSS needs %.2f GiB of system RAM for its "
-            "factors, but the budget is %.2f GiB (%s). %s"
-            % (peak_host / 1024**3, host_budget / 1024**3, host_tail, cause))
+        cap = CUDSS_HOST_LIMIT_GB * 1024**3
+        if peak_host > cap:
+            # The ceiling binds. No smaller group and no closed program
+            # can help; only more VRAM, a bigger cap, or a smaller mesh.
+            raise SystemExit(
+                "[rfsim] ERROR: cuDSS needs %.2f GiB of system RAM for "
+                "its factors, above the %.0f GiB cap of "
+                "CUDSS_HOST_LIMIT_GB (%s). Lowering `fem_group` does not "
+                "help here. Free the GPU (so the factors fit in VRAM), "
+                "raise the cap, or use a coarser mesh."
+                % (peak_host / 1024**3, CUDSS_HOST_LIMIT_GB, host_tail))
+        # The RAM that the group of matrices holds binds. `main` retries
+        # the sweep with a smaller group, which keeps fewer matrices in
+        # memory.
+        _cudss_last_short.clear()
+        _cudss_last_short["need"] = peak_host
+        _cudss_last_short["avail"] = host_avail
+        raise _CudssHostRam(
+            "cuDSS needs %.2f GiB of system RAM for its factors, but "
+            "%.2f GiB is available with the group of the sweep in memory"
+            % (peak_host / 1024**3,
+               (host_avail if host_avail is not None else 0) / 1024**3))
 
 
 def _cudss_hybrid():
@@ -1570,11 +1642,59 @@ def main(model_path, outdir):
     # The frequencies are solved in groups (`SWEEP_GROUP`), thus only one
     # group of assembled matrices is in memory at a time.
     group = max(1, min(int(s.get("fem_group") or SWEEP_GROUP), len(fs)))
+    first_group = group
     notes.append("It solves %d frequencies in groups of %d, thus at most %d "
                  "assembled matrices are in memory at a time"
                  % (len(fs), group, group))
     say("sweep: %d frequencies in groups of %d" % (len(fs), group))
-    data = sim.mw.run_sweep(frequency_groups=group)
+    while True:
+        try:
+            data = sim.mw.run_sweep(frequency_groups=group)
+            break
+        except _CudssHostRam as e:
+            # **The matrices of the group take the RAM that the host
+            # factors need.** The traceback of the error keeps the frames
+            # of the failed group, and the frames keep its matrices, thus
+            # drop it and collect before measuring. The RAM that the
+            # collect gives back is the cost of the whole group, so the
+            # new count is the part of it that fits with the factors.
+            text = str(e)
+            e.__traceback__ = None
+            _cudss_forget_matrices()
+            gc.collect()
+            if group <= 1:
+                raise SystemExit(
+                    "[rfsim] ERROR: %s. The sweep solves one frequency at "
+                    "a time already; close other programs, raise "
+                    "CUDSS_HOST_LIMIT_GB, or reduce the mesh." % text)
+            avail = _cudss_host_avail()
+            then = _cudss_last_short.get("avail")
+            need = _cudss_last_short.get("need")
+            new_group = max(1, group // 2)
+            if (avail is not None and then is not None
+                    and need is not None and avail > then):
+                per = (avail - then) / float(group)
+                room = avail - need - CUDSS_HOST_HEADROOM_GB * 1024**3
+                if per > 0:
+                    if room < per:
+                        # **Even one matrix and the factors do not fit
+                        # together.** The retry would pay the full
+                        # assembly to hear the gate say this again, so
+                        # stop here with the gate's own advice.
+                        raise SystemExit(
+                            "[rfsim] ERROR: %s. The group of 1 matrix and "
+                            "the factors need %.2f GiB more than the free "
+                            "RAM; close other programs, raise "
+                            "CUDSS_HOST_LIMIT_GB, or reduce the mesh."
+                            % (text, (per - room) / 1024**3))
+                    new_group = max(1, min(group - 1, int(room // per)))
+            group = new_group
+            say("WARNING: %s" % text)
+            say("retrying the sweep in groups of %d" % group)
+    if group != first_group:
+        notes.append("The sweep retried in groups of %d, because the host "
+                     "factors did not fit in the RAM that the larger group "
+                     "left" % group)
     g = data.scalar.grid
     say("solve: %d frequencies (%.0f s)" % (len(g.freq), time.time() - t0))
     if wave:

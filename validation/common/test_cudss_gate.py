@@ -53,10 +53,10 @@ def gate(device, host, limit, free, hybrid, available, cap):
         er.CUDSS_HOST_LIMIT_GB = old_cap
 
 
-def fails(fn, text):
+def fails(fn, text, exc=SystemExit):
     try:
         fn()
-    except SystemExit as e:
+    except exc as e:
         assert text in str(e), str(e)
         return
     raise AssertionError("the gate did not stop")
@@ -76,7 +76,21 @@ fails(lambda: gate(5.69, 0.0, 5.43, 5.69, False, 17.0, 10.0),
 gate(5.43, 10.89, 5.43, 5.69, True, 13.8, 12.0)
 
 # The 160,919-tet board needs 13.2 GiB of host RAM, above the 10 GiB cap.
+# The cap binds, thus no smaller group can help: a hard stop.
 fails(lambda: gate(5.43, 12.9, 5.43, 5.43, True, 17.0, 10.0),
       "cap of CUDSS_HOST_LIMIT_GB")
+
+# The run of 09:36: the 138k board needs 10.89 GiB, above the 10 GiB
+# cap. The cap binds even with an empty group, so this is a hard stop
+# that names the cap, not the group.
+fails(lambda: gate(5.43, 10.89, 5.43, 5.69, True, 3.72, 10.0),
+      "cap of CUDSS_HOST_LIMIT_GB")
+
+# A board whose host factors fit under the cap, while the group of the
+# sweep holds the RAM: the recoverable error, so `main` retries with a
+# smaller group.
+fails(lambda: gate(5.43, 8.0, 5.43, 5.69, True, 6.0, 10.0),
+      "available with the group of the sweep in memory",
+      er._CudssHostRam)
 
 print("all cuDSS gate tests OK")
