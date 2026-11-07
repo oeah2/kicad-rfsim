@@ -91,7 +91,7 @@ SWEEP_GROUP = 15
 # that is available now, thus this value is a ceiling and not a promise.
 # A factorization above this budget stops with "[rfsim] ERROR: cuDSS needs
 # ..."; reduce the mesh or raise this constant.
-CUDSS_HOST_LIMIT_GB = 10
+CUDSS_HOST_LIMIT_GB = 13
 # The system RAM kept free for the OS and for the arrays of EMerge, in GiB.
 # cuDSS pins its host factors, thus that memory cannot be swapped out.
 CUDSS_HOST_HEADROOM_GB = 1
